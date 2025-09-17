@@ -11,7 +11,7 @@ import getpass
 from datetime import datetime
 import numpy as np
 
-APP_Name    = "MDT CSV Editor"
+APP_Name    = "  CSV Editor"
 APP_Version = "v1.0"
 APP_Name = f"{APP_Name} {APP_Version}"
 
@@ -38,7 +38,7 @@ class TableEditor:
         tb.Button(frame, text="Save As", command=self.save_file_as, bootstyle="info").pack(side=tk.LEFT, padx=5)
         tb.Button(frame, text="Undo", command=lambda: self.sheet.undo(), bootstyle="warning").pack(side=tk.LEFT, padx=5)
         tb.Button(frame, text="Redo", command=lambda: self.sheet.redo(), bootstyle="warning").pack(side=tk.LEFT, padx=5)
-        tb.Button(frame, text="MDT Help", command=self.open_help, bootstyle="link").pack(side=tk.RIGHT, padx=5)
+        tb.Button(frame, text="  Help", command=self.open_help, bootstyle="link").pack(side=tk.RIGHT, padx=5)
 
         # Rounded dark mode toggle (right side)
         self.dark_mode_var = tk.BooleanVar(value=False)
@@ -54,7 +54,7 @@ class TableEditor:
         self.suggestion_mode_var = tk.BooleanVar(value=False)
         tb.Checkbutton(
             frame,
-            text="MDT Suggestion Mode",
+            text="  Suggestion Mode",
             variable=self.suggestion_mode_var,
             bootstyle="switch",
             command=self.toggle_suggestion_mode
@@ -124,7 +124,7 @@ class TableEditor:
         self.report_label = tk.Label(self.status_frame,text="Report Issue",fg="blue",cursor="hand2",anchor="w")
         self.report_label.pack(side=tk.LEFT, padx=10)
         
-        self.report_label.bind("<Button-1>",lambda e: webbrowser.open("mailto:pkyadav01234@gmail.com?subject=MDT CSV Editor Issue&body=Describe the issue here..."))
+        self.report_label.bind("<Button-1>",lambda e: webbrowser.open("mailto:pkyadav01234@gmail.com?subject=  CSV Editor Issue&body=Describe the issue here..."))
         # Load initial file if provided
         if initial_file and os.path.exists(initial_file):
             self.load_file(initial_file)
@@ -241,7 +241,7 @@ class TableEditor:
             # Customize log location (network/shared path or local)
             log_dir = r"K:\Users\pramod.kumar\shared\tool\log"
             os.makedirs(log_dir, exist_ok=True)  # ensure dir exists
-            log_file = os.path.join(log_dir, "mdt_csv_editor_log.log")
+            log_file = os.path.join(log_dir, " _csv_editor_log.log")
 
             with open(log_file, "a", encoding="utf-8") as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
