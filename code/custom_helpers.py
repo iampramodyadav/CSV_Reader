@@ -6,7 +6,7 @@ import os
 import re
 import pandas as pd
 from pyvis.network import Network
-from config import GRAPH_TYPE_COLORS, MDT_DROPDOWNS
+from config import GRAPH_TYPE_COLORS, DROPDOWN_DATA_PATH, MDT_DROPDOWNS_DEFAULT
 import numpy as np
 from typing import Iterable, Optional, Union
 
@@ -198,18 +198,38 @@ def plot_interactive_component_graph_coordinate(df, output_file: str = "graph.ht
     net.write_html(output_file, open_browser=open_browser)
     print(f"Graph saved to {output_file}")
     print(f"Parsed {len(parsed_data)} interfaces into {len(edge_counts)} unique edges")
+    
+import json
+import os
 
+def load_dropdown_data(file_path):
+    """Loads dropdown configuration from a JSON file."""
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading JSON: {e}")
+            return MDT_DROPDOWNS_DEFAULT
+    else:
+        print("JSON file not found. Using empty dropdowns.")
+        return MDT_DROPDOWNS_DEFAULT
+        
 def get_mdt_dropdown_config(filename: str) -> dict:
     """
-    Get dropdown configuration based on filename prefix.
-    Returns dict of {column_name: options}
+    Dynamically matches the filename against keys in the JSON config.
+    If the filename starts with a key (e.g., 'Turbine_Comp'), 
+    it returns that configuration.
     """
-    if filename.startswith("Turbine_Comp"):
-        return MDT_DROPDOWNS["Turbine_Comp"]
-    elif filename.startswith("Turbine_Conta"):
-        return MDT_DROPDOWNS["Turbine_Conta"]
-    elif filename.startswith("Turbine_Joint"):
-        return MDT_DROPDOWNS["Turbine_Joint"]
+    # Load the data (In production, load this once globally to save performance)
+    mdt_dropdowns = load_dropdown_data(DROPDOWN_DATA_PATH)
+    
+    # Iterate through the keys in the JSON (Turbine_Comp, Turbine_Conta, etc.)
+    for key in mdt_dropdowns.keys():
+        if filename.startswith(key):
+            return mdt_dropdowns[key]
+            
+    # Default return if no match is found
     return {}
 
 
@@ -387,12 +407,3 @@ def write_label_format(path, df, sep="::"):
                 line += "  " + str(row[h]).rjust(col_widths[h])
             f.write(line + "\n")
 
-
-# if __name__ == "__main__":
-#     path = r'coordinateTable_FSTMKVII.txt'
-#     path1 = r'coordinateTable_FSTMKVII2.txt'
-#     comp_path = r"K:\Groups\OFTDDDMKVII\BEA\SFFB\FST\00\Turbine_Comp_Catalogue_FSTMKVIIGR00GI00.csv"
-#     coordinateTable = r"K:\Groups\OFTDDDMKVII\BEA\SFFB\FST\00\coordinateTable_FSTMKVII.txt"
-#     labels, identifiers, data, df = read_label_format(coordinateTable)
-#     write_label_format(path1, df, sep="::")
-#     plot_interactive_component_graph_coordinate(df,comp_csv =comp_path  )

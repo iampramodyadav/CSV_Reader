@@ -14,8 +14,8 @@ import ttkbootstrap as tb
 from formula_engine import FormulaEngine
 from ui_components import UIComponents
 from custom_helpers import plot_interactive_component_graph_coordinate, get_mdt_dropdown_config, get_file_list_for_column, plot_interactive_component_graph, trim_whitespace, read_label_format, write_label_format,fill_nulls
-from config import APP_TITLE, DEFAULT_THEME,DEFAULT_DARK_THEME, LOG_DIR, LOG_FILE, APP_VERSION, FORMULA_HELP_TEXT,SHEET_LIGHT_THEME, SHEET_DARK_THEME
-
+from config import PLUGIN_FILE_PATH, APP_TITLE, DEFAULT_THEME,DEFAULT_DARK_THEME, LOG_DIR, LOG_FILE, APP_VERSION, FORMULA_HELP_TEXT,SHEET_LIGHT_THEME, SHEET_DARK_THEME
+from plugin_manager import load_plugins, run_plugin
 
 
 class TableEditor:
@@ -44,7 +44,7 @@ class TableEditor:
         
         # Build UI
         self._setup_ui()
-        
+        self._setup_plugin_menu()
         # Load initial file or show empty sheet
         if initial_file and os.path.exists(initial_file):
             self.load_file(initial_file)
@@ -69,7 +69,100 @@ class TableEditor:
         
         UIComponents.create_formula_bar(self.root, self)
         UIComponents.create_status_bar(self.root, self)
+    def _setup_plugin_menu(self):
+        """Build the Plugins menu from the plugin file."""
+        # import tkinter as tk
 
+        # Find the existing menu bar
+        menubar = self.root["menu"]
+        if not menubar:
+            return
+        menubar_widget = self.root.nametowidget(menubar)
+
+        # Create Plugins top-level menu
+        self._plugin_menu = tk.Menu(menubar_widget, tearoff=0)
+        menubar_widget.add_cascade(label="Plugins", menu=self._plugin_menu)
+
+        # Add reload + open-file utilities
+        self._plugin_menu.add_command(
+            label="⟳  Reload Plugins",
+            command=self._reload_plugin_menu
+        )
+        self._plugin_menu.add_command(
+            label="📂  Open Plugin File",
+            command=lambda: self._open_plugin_file(PLUGIN_FILE_PATH)
+        )
+        self._plugin_menu.add_separator()
+
+        # Load and populate plugin entries
+        self._populate_plugin_entries()
+
+
+    def _populate_plugin_entries(self):
+        """Clear and re-add all plugin entries from the plugin file."""
+
+        # Remove everything after the first 3 fixed items (Reload, Open, separator)
+        end = self._plugin_menu.index("end")
+        if end is not None and end >= 3:
+            for i in range(end, 2, -1):  # remove from end down to index 3
+                self._plugin_menu.delete(i)
+
+        plugins = load_plugins()
+        if not plugins:
+            self._plugin_menu.add_command(
+                label="(No plugins found — check plugin file path)",
+                state="disabled"
+            )
+            return
+
+        for label in plugins:
+            self._plugin_menu.add_command(
+                label=label,
+                command=lambda lbl=label: self._run_plugin(lbl)
+            )
+
+
+    def _reload_plugin_menu(self):
+        """Reload plugin file and rebuild menu."""
+        self._populate_plugin_entries()
+        self.set_status("Plugins reloaded.")
+
+
+    def _open_plugin_file(self, path):
+        """Open the plugin file in the default editor (Notepad, VS Code, etc.)."""
+        import subprocess, os
+        if os.path.exists(path):
+            # os.startfile(path)   # Windows; use subprocess.run(["xdg-open", path]) on Linux
+            npp_path = r"C:\Program Files\Notepad++\notepad++.exe"
+
+            if os.path.exists(npp_path):
+                subprocess.Popen([npp_path, path])
+            else:
+                print("Notepad++ not found. Falling back to system Notepad.")
+                subprocess.Popen(['notepad.exe', path])
+        else:
+            messagebox.showwarning(
+                "Plugin file not found",
+                f"Plugin file does not exist:\n{path}\n\nCreate it to get started."
+            )
+
+
+    def _run_plugin(self, label):
+        """Sync sheet → df, run plugin, then push result back to sheet."""
+        from plugin_manager import run_plugin
+        
+        # Always sync latest sheet data into df first
+        self.update_dataframe_from_sheet()
+        
+        df_result = run_plugin(label, self.df, self)
+        
+        # If plugin returned a modified df, push it back to the sheet
+        if df_result is not None and not df_result.equals(self.df):
+            self.df = df_result
+            self.workbook_sheets[self.current_sheet_name] = self.df
+            self.update_sheet_from_dataframe()
+            self.mark_modified()
+            
     def _create_sheet_tab(self, sheet_name: str, df: Optional[pd.DataFrame] = None):
         """Create a new sheet tab."""
         tab_frame = tb.Frame(self.sheet_notebook)
@@ -1296,7 +1389,7 @@ class TableEditor:
             dropdown_display = [f"{val} - {desc}" for val, desc in options.items()]
             valid_values = set(options.keys())
         else:
-            dropdown_display = list(options)
+            dropdown_display = sorted(list(options))
             valid_values = set(options)
         
         for r in range(len(self.df)):
