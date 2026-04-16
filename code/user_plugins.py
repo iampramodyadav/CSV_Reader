@@ -18,6 +18,14 @@ your function(df, app)
 """
 import pandas as pd
 import os
+import sys
+from pathlib import Path
+
+TOOL_PATHS = {
+    'BEA_VALIDATION': Path(r"K:\Common\Tools\CSVEditor\plugins"),
+}
+sys.path.extend(str(path) for path in TOOL_PATHS.values())
+import conta_catalogue_from_coord as coord
 # ─── PLUGIN REGISTRY ──────────────────────────────────────────────────────────
 # Add your function here to make it appear in the app menu.
 # Format: "Menu Label": function_name
@@ -80,4 +88,19 @@ def export_sensor_names(df, app):
         for val in df.iloc[:, 0]:
             f.write(str(val) + "\n")
     app.set_status(f"Sensor names → {out}")
+    return None
+    
+@register("Write: Tesp CSV Conta from Coord")
+def create_conta_csv_temp(df, app):
+
+    #abs_path = os.path.abspath(app.current_file)
+    dir_name = os.path.dirname(app.current_file)
+    out_file = os.path.join(dir_name, "temp_conta_file.csv")
+    
+    if 'coordinateTable' in app.current_file:
+        coord.create_csv_conta(app.current_file, out_file)
+        app.set_status(f"temp_conta_file.csv' written in {out_file}")
+    else:
+        app.set_status(f"current file is not coordinate file")
+    
     return None

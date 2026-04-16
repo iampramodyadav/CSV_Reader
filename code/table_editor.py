@@ -14,11 +14,23 @@ import ttkbootstrap as tb
 from formula_engine import FormulaEngine
 from ui_components import UIComponents
 from custom_helpers import plot_interactive_component_graph_coordinate, get_mdt_dropdown_config, get_file_list_for_column, plot_interactive_component_graph, trim_whitespace, read_label_format, write_label_format,fill_nulls
-from config import PLUGIN_FILE_PATH, APP_TITLE, DEFAULT_THEME,DEFAULT_DARK_THEME, LOG_DIR, LOG_FILE, APP_VERSION, FORMULA_HELP_TEXT,SHEET_LIGHT_THEME, SHEET_DARK_THEME
+from config import PLUGIN_FILE_PATH, APP_TITLE, DEFAULT_THEME,DEFAULT_DARK_THEME, LOG_DIR, LOG_FILE, APP_VERSION, FORMULA_HELP_TEXT,SHEET_LIGHT_THEME, SHEET_DARK_THEME, RECENT_FILE
 from plugin_manager import load_plugins, run_plugin
+import json
+from pathlib import Path
+import tempfile
 
+from mixins.cf_mixin import CFMixin
+from mixins.undo_mixin import UndoMixin
+from mixins.formula_mixin import FormulaMixin
+from mixins.diff_mixin import DiffMixin
+from mixins.split_view_mixin import SplitViewMixin
+from mixins.prefs_mixin   import PrefsMixin
+from mixins.filter_mixin  import FilterMixin
+from mixins.palette_mixin import PaletteMixin
+from mixins.extras_mixin import ExtrasMixin
 
-class TableEditor:
+class TableEditor(UndoMixin, CFMixin, FormulaMixin, DiffMixin, SplitViewMixin, PrefsMixin, FilterMixin, PaletteMixin, ExtrasMixin):
     """Main application class for spreadsheet editing."""
 
     def __init__(self, root, initial_file=None):
@@ -36,8 +48,20 @@ class TableEditor:
         # Multi-sheet support
         self.workbook_sheets: Dict[str, pd.DataFrame] = {}
         self.current_sheet_name = None
-        self.formula_engine = None
+        # self.formula_engine = None
         self.formula_cells = {}  # {sheet_name: {row,col: formula}}
+        self._init_undo_state()
+        
+        # ── NEW: per-tab metadata ─────────────────────────────────────────────
+        # key  : sheet_name (tab label string)  ← unique because we enforce it
+        # value: dict with keys:
+        #   file_path   – str | None
+        #   sep         – separator string used to load this tab
+        #   modified    – bool, dirty flag for THIS tab only
+        #   excel_name  – str | None  (base filename if from excel, else None)
+        #   is_excel    – bool
+        self.tab_meta: Dict[str, dict] = {}
+        # ─────────────────────────────────────────────────────────────────────     
         
         # Theme
         self.style = tb.Style(DEFAULT_THEME)
@@ -45,23 +69,38 @@ class TableEditor:
         # Build UI
         self._setup_ui()
         self._setup_plugin_menu()
+        self._load_prefs()                    # ← PrefsMixin: loads and applies saved settings
+        self._register_palette_commands()     # ← PaletteMixin: builds the command list
+        self._setup_extras()               # ← ADD
         # Load initial file or show empty sheet
         if initial_file and os.path.exists(initial_file):
-            self.load_file(initial_file)
+            self.load_file_guarded(initial_file)
         else:
-            self.update_sheet_from_dataframe()
+            try:
+                prefs = getattr(self, '_prefs')
+                startup_file = prefs.get("startup_file", "")
+                if startup_file.strip() != "":
+                    self.load_file_guarded(startup_file)
+                else:
+                    self.update_sheet_from_dataframe()
+            except:
+                self.update_sheet_from_dataframe()
 
     def _setup_ui(self):
         """Setup all UI components."""
         UIComponents.create_menu_bar(self.root, self)
         UIComponents.create_toolbar(self.root, self)
-        
+        self._build_filter_bar(self.root)
         # Content frame with notebook
+        # content_frame = tb.Frame(self.root)
+        # content_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # self.sheet_notebook = ttk.Notebook(content_frame)
+        # self.sheet_notebook.pack(fill=tk.BOTH, expand=True)
         content_frame = tb.Frame(self.root)
         content_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.sheet_notebook = ttk.Notebook(content_frame)
-        self.sheet_notebook.pack(fill=tk.BOTH, expand=True)
+        self._split_content_frame = content_frame          # store ref for mixin
+        self.sheet_notebook = self._build_left_pane(content_frame)  # mixin builds it
+                
         self.sheet_notebook.bind('<<NotebookTabChanged>>', self._on_sheet_change)
         
         # Create first sheet
@@ -149,8 +188,8 @@ class TableEditor:
 
     def _run_plugin(self, label):
         """Sync sheet → df, run plugin, then push result back to sheet."""
-        from plugin_manager import run_plugin
-        
+        # from plugin_manager import run_plugin
+        self._push_undo() 
         # Always sync latest sheet data into df first
         self.update_dataframe_from_sheet()
         
@@ -163,8 +202,18 @@ class TableEditor:
             self.update_sheet_from_dataframe()
             self.mark_modified()
             
-    def _create_sheet_tab(self, sheet_name: str, df: Optional[pd.DataFrame] = None):
-        """Create a new sheet tab."""
+    def _create_sheet_tab(self, sheet_name: str, df: Optional[pd.DataFrame] = None,
+                          file_path: str = None, sep: str = ',',
+                          excel_name: str = None, is_excel: bool = False):
+        """Create a new sheet tab. Now stores per-tab file metadata."""
+        
+        # ── Make sheet_name unique across ALL currently open tabs ─────────────
+        base = sheet_name
+        counter = 1
+        while sheet_name in self.workbook_sheets:
+            sheet_name = f"{base}_{counter}"
+            counter += 1
+    
         tab_frame = tb.Frame(self.sheet_notebook)
         self.sheet_notebook.add(tab_frame, text=sheet_name)
         
@@ -174,45 +223,68 @@ class TableEditor:
         )
         sheet.enable_bindings(("single_select", "row_select", "column_select", "drag_select",
                               "edit_cell", "edit_header", "copy", "cut", "paste", "delete",
-                              "undo", "redo", "find", "replace", "arrowkeys",
+                              "undo", "redo", "find", "replace", "replace_all","arrowkeys",
                               "sort_columns", "sort_rows", "rc_insert_row", "rc_delete_row",
                               "row_height_resize", "column_height_resize", "column_width_resize",
-                              "row_width_resize", "rc_insert_column", "rc_delete_column"))
+                              "row_width_resize", "rc_insert_column", "rc_delete_column", "double_click_row_resize", 
+                              "ctrl_select", "double_click_column_resize","move_columns","move_rows", "arrowkeys", "select_all"))
+        
+        sheet.disable_bindings("undo", "redo")          # removes Ctrl+Z/Y from tksheet
+        self._bind_sheet_modified(sheet, sheet_name)    # wire our handler
         
         sheet.pack(fill=tk.BOTH, expand=True)
         
-        # Bind events
         sheet.extra_bindings([
             ("rc_insert_column", self.add_column),
             ("rc_insert_row", self.insert_row),
             ("cell_select", self.update_selection_status),
             ("drag_select_cells", self.update_selection_status),
             ("end_edit_cell", self.on_cell_edit),
+            # ("end_edit_cell",    self._filter_sync_edit),   # ← ADD THIS
             ("end_edit_header", self.mark_modified),
             ("rc_delete_column", self.mark_modified),
             ("rc_delete_row", self.mark_modified),
             ("paste", self.mark_modified),
             ("delete", self.mark_modified),
             ("cut", self.mark_modified),
-            ("undo", self.mark_modified),
-            ("redo", self.mark_modified),
+            ("replace", self.mark_modified),
+            ("replace_all", self.mark_modified),
+            ("sort_columns", self.mark_modified),
+            ("move_columns", self.mark_modified),
+            ("move_rows", self.mark_modified),
+            # ("undo", self.mark_modified),
+            # ("redo", self.mark_modified),
         ])
         
-        # Custom popup menu
-        sheet.popup_menu_add_command("Autofill (Ctrl+R)", self.autofill_selection)
-        sheet.popup_menu_add_command("Rename Sheet", self.rename_sheet)
-        sheet.popup_menu_add_command("Trim Spaces(❌ Undo)", self.clean_whitespace)
         sheet.bind("<Control-r>", self.autofill_selection)
+        self.bind_navigation_shortcuts(sheet)
+        
+        sheet.popup_menu_add_command("Extract Rows to New Tab",self.extract_selection_to_new_tab)
+        sheet.popup_menu_add_command("Open Containing Folder",self.open_containing_folder)
+        sheet.popup_menu_add_command("Copy Full Path",        self.copy_full_path)
+        sheet.popup_menu_add_command("Copy File Name",        self.copy_file_name)      
+        sheet.popup_menu_add_command("Rename Sheet", self.rename_sheet)
+        sheet.popup_menu_add_command("Close This Tab", self.close_current_tab)
+        sheet.popup_menu_add_command('Column Stats', self.show_column_stats)
+        sheet.popup_menu_add_command("Autofill (Ctrl+R)", self.autofill_selection)
+
         
         # Store DataFrame
-        if df is not None:
-            self.workbook_sheets[sheet_name] = df
-        else:
-            self.workbook_sheets[sheet_name] = pd.DataFrame()
-        
+        # print(df)
+        self.workbook_sheets[sheet_name] = df if df is not None else pd.DataFrame()
+        # print(df)
         self.current_sheet_name = sheet_name
         
-        # Initialize formula engine
+        # ── NEW: store per-tab metadata ───────────────────────────────────────
+        self.tab_meta[sheet_name] = {
+            "file_path": file_path,
+            "sep":       sep,
+            "modified":  False,
+            "excel_name": excel_name,
+            "is_excel":   is_excel,
+        }
+        # ─────────────────────────────────────────────────────────────────────
+        
         if not hasattr(self, 'formula_engine') or self.formula_engine is None:
             self.formula_engine = FormulaEngine(sheet)
         
@@ -268,6 +340,11 @@ class TableEditor:
                 sheet_data = self.workbook_sheets.pop(current_sheet_name) # Remove with old key
                 sheet_data.name = new_name                       # Update name in SheetData object
                 self.workbook_sheets[new_name] = sheet_data               # Insert with new key
+                # Keep tab_meta in sync with renamed sheet
+                if current_sheet_name in self.tab_meta:
+                    self.tab_meta[new_name] = self.tab_meta.pop(current_sheet_name)
+                if current_sheet_name in self.formula_cells:
+                    self.formula_cells[new_name] = self.formula_cells.pop(current_sheet_name)
                 self.current_sheet_name = new_name               # Update the current reference
                 
                 self.set_status(f"Sheet renamed from '{current_sheet_name}' to '{new_name}'.")
@@ -276,48 +353,26 @@ class TableEditor:
                 messagebox.showerror("Error", f"Failed to rename sheet: {e}")
 
     def _on_sheet_change(self, event=None):
-        """Handle sheet tab change."""
+        """Handle sheet tab change — sync all per-tab globals."""
         sheet = self.get_current_sheet()
         if sheet:
             self.current_sheet_name = self.sheet_notebook.tab(self.sheet_notebook.select(), "text")
-            self.df = self.workbook_sheets.get(self.current_sheet_name, pd.DataFrame())
-            self.formula_engine.sheet = sheet
+            # print("_on_sheet_change-_sync_globals_from_current_tab")
+            self._sync_globals_from_current_tab()          # ← replaces the old manual df/formula lines
+            # Guard: formula_engine may not exist yet during startup
+            if self.formula_engine is not None:
+                self.formula_engine.sheet = sheet
             self.update_selection_status()
-            self.set_status(f"Sheet changed to {self.current_sheet_name}")
-
-    def add_new_sheet(self):
-        """Add new sheet with save options for non-Excel."""
-        sheet_num = len(self.workbook_sheets) + 1
-        sheet_name = f"Sheet{sheet_num}"
-        while sheet_name in self.workbook_sheets:
-            sheet_num += 1
-            sheet_name = f"Sheet{sheet_num}"
-        
-        is_excel = self.current_file and self.current_file.endswith(('.xlsx', '.xls'))
-        
-        if not is_excel and len(self.workbook_sheets) > 0:
-            response = messagebox.askyesnocancel(
-                "New Sheet",
-                f"Current file is not Excel format.\n\n"
-                f"YES: Save new sheet as separate file\n"
-                f"NO: Add sheet (will convert to Excel on save)\n"
-                f"CANCEL: Don't add sheet"
-            )
-            
-            if response is None:
-                return
-            elif response is True:
-                self._save_sheet_as_separate_file(sheet_name)
-                return
-        
-        df = pd.DataFrame(columns=["Column1", "Column2"])
-        self._create_sheet_tab(sheet_name, df)
-        self.sheet_notebook.select(len(self.workbook_sheets) - 1)
-        self.modified = True
-        self.update_title()
-        self.set_status(f"Added new sheet: {sheet_name}")
-        self.update_dataframe_from_sheet()
-        self.update_sheet_from_dataframe()
+            # Show which file this tab belongs to in status
+            meta = self.tab_meta.get(self.current_sheet_name, {})
+            fp = meta.get("file_path")
+            label = os.path.basename(fp) if fp else "Unsaved"
+            self.set_status(f"Tab: {self.current_sheet_name}  |  File: {label}")
+            if hasattr(self, 'apply_cf_rules'):
+                self.apply_cf_rules()
+            self.update_title()
+            self._refresh_right_pane()
+            self._on_filter_tab_change() 
     
     def _save_sheet_as_separate_file(self, sheet_name: str):
         """Save new sheet as separate file."""
@@ -340,7 +395,7 @@ class TableEditor:
             return
         
         try:
-            df = pd.DataFrame(columns=["Column1", "Column2"])
+            df = pd.DataFrame("",index=range(5), columns=["A", "B", "C", "D","E"])
             
             if file_path.endswith(('.xlsx', '.xls')):
                 df.to_excel(file_path, index=False, sheet_name=sheet_name)
@@ -352,7 +407,7 @@ class TableEditor:
             messagebox.showinfo("Success", f"New sheet saved as:\n{file_path}")
             
             if messagebox.askyesno("Open File?", "Do you want to open the new file?"):
-                self.load_file(file_path)
+                self.load_file_guarded(file_path)
         
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save separate file: {e}")
@@ -360,9 +415,10 @@ class TableEditor:
     def _populate_sheet(self, sheet_widget: tksheet.Sheet, df: pd.DataFrame):
         """Populate sheet with DataFrame."""
         if df.empty:
-            sheet_widget.headers(["Column1", "Column2"])
-            sheet_widget.set_sheet_data([["", ""]])
+            sheet_widget.headers(["A", "B", "C", "D","E"])
+            sheet_widget.set_sheet_data([["", "", "", "", ""], ["", "", "", "", ""]])
         else:
+            # print(f"_populate_sheet {df}")
             sheet_widget.headers([str(c) for c in df.columns])
             sheet_widget.set_sheet_data(df.astype(str).values.tolist())
         
@@ -376,8 +432,12 @@ class TableEditor:
             return
         
         if self.df.empty:
-            sheet.headers(["Column1", "Column2"])
-            sheet.set_sheet_data([["", ""]])
+            sheet.headers(["A", "B", "C", "D","E"])
+            sheet.set_sheet_data([  ["", "", "", "", ""],
+                                    ["", "", "", "", ""],
+                                    ["", "", "", "", ""], 
+                                    ["", "", "", "", ""], 
+                                    ["", "", "", "", ""]])
             self.update_dataframe_from_sheet()
 
         else:
@@ -388,57 +448,106 @@ class TableEditor:
         
         self.toggle_dark_mode()
         sheet.refresh()
-
+        self.apply_cf_rules()
+        self._refresh_pre_edit_snapshot()
+        if hasattr(self, 'apply_cf_rules'):
+            self.apply_cf_rules()
+        self._refresh_right_pane()
+        self._on_df_changed_outside_filter()
+        
     def update_dataframe_from_sheet(self):
         """Sync DataFrame from sheet."""
         sheet = self.get_current_sheet()
         if not sheet:
             return
-        
+        if hasattr(self, '_filter_is_active') and self._filter_is_active():
+            return                        # ← ADD THESE TWO LINES
         self.df = pd.DataFrame(sheet.get_sheet_data(), columns=sheet.headers())
         self.workbook_sheets[self.current_sheet_name] = self.df
 
     def toggle_dark_mode(self):
-        """Apply dark/light theme."""
+        """Apply dark/light app theme. Sheet theme is set independently via Preferences."""
         self.dark_mode = self.dark_mode_var.get()
-        self.style.theme_use(DEFAULT_DARK_THEME if self.dark_mode else DEFAULT_THEME)
-        
-        # sheet_theme = "dark" if self.dark_mode else "light blue"
-        sheet_theme = SHEET_DARK_THEME if self.dark_mode else SHEET_LIGHT_THEME
-
-        for tab_id in self.sheet_notebook.tabs():
-            tab_frame = self.sheet_notebook.nametowidget(tab_id)
-            for widget in tab_frame.winfo_children():
-                if isinstance(widget, tksheet.Sheet):
-                    widget.set_options(theme=sheet_theme, align="center")
-                    widget.refresh()
-        
+    
+        # ── App (ttkbootstrap) theme ──────────────────────────────────────────
+        # Use theme from preferences if available, else fall back to config defaults
+        if hasattr(self, '_prefs'):
+            app_theme = self._prefs.get("theme", DEFAULT_THEME)
+            # If the saved theme clashes with dark_mode state, pick sensibly
+            from mixins.prefs_mixin import THEMES_DARK
+            if self.dark_mode and app_theme not in THEMES_DARK:
+                app_theme = DEFAULT_DARK_THEME
+            elif not self.dark_mode and app_theme in THEMES_DARK:
+                app_theme = DEFAULT_THEME
+        else:
+            app_theme = DEFAULT_DARK_THEME if self.dark_mode else DEFAULT_THEME
+    
+        self.style.theme_use(app_theme)
+    
+        # ── Sheet (tksheet) theme — from preferences, not hardcoded ──────────
+        if hasattr(self, '_apply_sheet_theme_from_prefs'):
+            self._apply_sheet_theme_from_prefs()
+        else:
+            # Fallback if prefs mixin not loaded
+            sheet_theme = SHEET_DARK_THEME if self.dark_mode else SHEET_LIGHT_THEME
+            for tab_id in self.sheet_notebook.tabs():
+                tab_frame = self.sheet_notebook.nametowidget(tab_id)
+                for widget in tab_frame.winfo_children():
+                    if isinstance(widget, tksheet.Sheet):
+                        widget.set_options(theme=sheet_theme, align="center")
+                        widget.refresh()
+    
+        # ── Status bar colours ────────────────────────────────────────────────
         status_bg, status_fg = ("#2e2e2e", "white") if self.dark_mode else ("#f0f0f0", "black")
         self.status_frame.config(bg=status_bg)
         self.left_status.config(bg=status_bg, fg=status_fg)
         self.right_status.config(bg=status_bg, fg=status_fg)
         self.select_status.config(bg=status_bg, fg=status_fg)
         self.cell_info.config(bg=status_bg, fg=status_fg)
+    
+        # ── Sync split view right pane if open ────────────────────────────────
+        if hasattr(self, 'update_right_pane_theme'):
+            self.update_right_pane_theme()
 
     def mark_modified(self, event=None):
-        """Mark sheet modified."""
-        self.modified = True
+        """Mark THIS tab as modified (not the whole session)."""
+        # Per-tab flag
+        if self.current_sheet_name in self.tab_meta:
+            self.tab_meta[self.current_sheet_name]["modified"] = True
+    
+        # Global flag = True if any tab is dirty
+        self.modified = any(m["modified"] for m in self.tab_meta.values())
+    
         self.update_title()
+        # self._push_undo() 
         self.update_dataframe_from_sheet()
         if self.suggestion_mode_var.get():
             self.clean_dropdown_value()
             self.customize_turbine_columns()
-
+    
         sheet = self.get_current_sheet()
         if sheet:
             sheet.refresh()
         self.set_status("Modified")
-
+        
+        if hasattr(self, 'apply_cf_rules'):
+            self.apply_cf_rules()
+        self._refresh_right_pane()
+        
     def update_title(self):
-        """Update window title."""
-        name = os.path.basename(self.current_file) if self.current_file else "Untitled"
-        self.root.title(f"{APP_TITLE} - {name}{'*' if self.modified else ''}")
-
+        """Title = AppName - active_file [*dirty_tabs*]"""
+        meta = self.tab_meta.get(self.current_sheet_name, {})
+        fp = meta.get("file_path")
+        modif = meta.get("modified")
+        # name = os.path.basename(fp) if fp else "Untitled"
+        name = fp if fp else "Untitled"
+        dirty_count = sum(1 for m in self.tab_meta.values() if m.get("modified"))
+        dirty_str = f"  [{dirty_count} unsaved]" if dirty_count else ""
+        if modif:
+            self.root.title(f"{APP_TITLE} - {name}*{dirty_str}")
+        else:
+            self.root.title(f"{APP_TITLE} - {name}{dirty_str}")
+            
     def set_status(self, text):
         """Update status bar."""
         self.right_status.config(text=text)
@@ -470,119 +579,195 @@ class TableEditor:
         return True
 
     def on_close(self):
-        """Handle window close."""
-        if self.modified and not self.ask_save_changes("exit"):
-            return
+        """Check all tabs for unsaved changes before exit."""
+        dirty_tabs = [name for name, m in self.tab_meta.items() if m.get("modified")]
+        if dirty_tabs:
+            names = "\n".join(f"  • {t}" for t in dirty_tabs)
+            result = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                f"These tabs have unsaved changes:\n{names}\n\nSave before exiting?"
+            )
+            if result is None:    # Cancel
+                return
+            if result is True:    # Save all
+                # Save each unique file
+                saved = set()
+                original_tab = self.current_sheet_name
+                for tab_name in dirty_tabs:
+                    fp = self.tab_meta[tab_name].get("file_path")
+                    if fp and fp not in saved:
+                        # Temporarily switch context to save correctly
+                        self.current_sheet_name = tab_name
+                        self._sync_globals_from_current_tab()
+                        self.save_file()
+                        saved.add(fp)
+                self.current_sheet_name = original_tab
         self.root.destroy()
-    def load_file(self, file_path: str):
-        """Load file with Excel multi-sheet support."""
+
+    def load_file(self, file_path: str, force_sep: str = None):
+        """
+        Load a file and ADD its sheets to the session.
+        Never clears existing tabs — each call appends new tabs.
+        force_sep: override auto-detection (used by "Add File" with separator choice).
+        """
         try:
-            for tab_id in self.sheet_notebook.tabs():
-                self.sheet_notebook.forget(tab_id)
-            self.workbook_sheets.clear()
+            sep_to_use = force_sep #or self.current_sep
+            # ── NEW: remove the empty startup Sheet1 if it's the only tab
+            # and has never been modified (no file, empty df).
+            # This prevents it from polluting the undo history.
+            self._remove_empty_startup_sheet()   # ← ADD THIS CALL
             
             if file_path.endswith(('.xlsx', '.xls')):
                 excel_file = pd.ExcelFile(file_path)
+                excel_base = os.path.basename(file_path)          # e.g. "data.xlsx"
                 for sheet_name in excel_file.sheet_names:
                     df = pd.read_excel(excel_file, sheet_name=sheet_name, keep_default_na=False)
-                    sheet_widget = self._create_sheet_tab(sheet_name, df)
+                    # Tab label = "data.xlsx » Sheet1"  — clearly shows which file it came from
+                    tab_label = f"{os.path.splitext(excel_base)[0]} » {sheet_name}"
+                    sheet_widget = self._create_sheet_tab(
+                        tab_label, df,
+                        file_path=file_path, sep=None,
+                        excel_name=excel_base, is_excel=True
+                    )
                     self._populate_sheet(sheet_widget, df)
-                
-                self.txt_sepa = None
-                
+                    # ── Seed snapshot AFTER populate so it has real data ──────
+                    self._refresh_pre_edit_snapshot(tab_label)   # ← ADD
+                # Switch to first newly added Excel sheet
+                # Find last tab index and jump to first of newly added batch
+                self.sheet_notebook.select(len(self.sheet_notebook.tabs()) - len(excel_file.sheet_names))
+    
             else:
+                # ── Auto-detect separator ─────────────────────────────────────
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     first_line = f.readline()
-
-                if self.current_sep=="#label" and "#label" in first_line.lower():
-                    # print(file_path)
-                    _, _, _, self.df = read_label_format(file_path)
-                    self.txt_sepa = "#label"
-
-                elif self.current_sep:
-                    sep_used = self.current_sep
-                    self.df = pd.read_csv(file_path, sep=sep_used, engine="python", keep_default_na=False, na_values=[])
-                    self.txt_sepa = sep_used
+    
+                if sep_to_use == "#label" or (not sep_to_use and "#label" in first_line.lower()):
+                    _, _, _, df = read_label_format(file_path)
+                    detected_sep = "#label"
+                elif sep_to_use:
+                    df = pd.read_csv(file_path, sep=sep_to_use, engine="python",
+                                     keep_default_na=False, na_values=[])
+                    detected_sep = sep_to_use
+                elif file_path.endswith(".tsv") or "\t" in first_line:
+                    df = pd.read_csv(file_path, sep="\t", engine="python",
+                                     keep_default_na=False, na_values=[])
+                    detected_sep = "\t"
+                elif ";" in first_line:
+                    df = pd.read_csv(file_path, sep=";", engine="python",
+                                     keep_default_na=False, na_values=[])
+                    detected_sep = ";"
+                elif "," in first_line:
+                    df = pd.read_csv(file_path, sep=",", engine="python",
+                                     keep_default_na=False, na_values=[])
+                    detected_sep = ","
+                elif file_path.endswith(".txt") and " " in first_line:
+                    df = pd.read_csv(file_path, sep=r"\s+", engine="python",
+                                     keep_default_na=False, na_values=[])
+                    detected_sep = r"\s+"
                 else:
-                    # with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    #     first_line = f.readline()
-                    if file_path.endswith(".tsv") or "\t" in first_line:
-                        self.df = pd.read_csv(file_path, sep=r"\t", engine="python", keep_default_na=False, na_values=[])
-                        self.txt_sepa = "\t"
-                    elif ";" in first_line:
-                        self.df = pd.read_csv(file_path, sep=";", engine="python", keep_default_na=False, na_values=[])
-                        self.txt_sepa = ";"
-
-                    elif "," in first_line:
-                        self.df = pd.read_csv(file_path, sep=",", engine="python", keep_default_na=False, na_values=[])
-                        self.txt_sepa = ","
-
-                    elif file_path.endswith(".txt") and "#label" in first_line.lower():
-                        _, _, _, self.df = read_label_format(file_path)
-                        self.txt_sepa = "#label"
-
-                    elif file_path.endswith(".txt") and " " in first_line:
-                        self.df = pd.read_csv(file_path, sep=r"\s+", engine="python", keep_default_na=False, na_values=[])
-                        self.txt_sepa = r"\s+"
-                    else:
-                        self.df = pd.read_csv(file_path, keep_default_na=False, na_values=[])
-                        self.txt_sepa = ","
-                
+                    df = pd.read_csv(file_path, keep_default_na=False, na_values=[])
+                    detected_sep = ","
+    
                 sheet_name = os.path.splitext(os.path.basename(file_path))[0]
-                sheet_widget = self._create_sheet_tab(sheet_name, self.df)
-                self._populate_sheet(sheet_widget, self.df)
-            
-            self.current_file = file_path
-            self.modified = False
-            self.update_title()  
+                sheet_widget = self._create_sheet_tab(
+                    sheet_name, df,
+                    file_path=file_path, sep=detected_sep,
+                    excel_name=None, is_excel=False
+                )
+                self._populate_sheet(sheet_widget, df)
+                # ── Seed snapshot AFTER populate ──────────────────────────────
+                self._refresh_pre_edit_snapshot(sheet_name)   # ← ADD
+                # Switch to the newly added tab
+                self.sheet_notebook.select(len(self.sheet_notebook.tabs()) - 1)
+    
+            # Update globals to reflect current tab
+            self._sync_globals_from_current_tab()
+            self.update_title()
             if self.suggestion_mode_var.get():
                 self.customize_turbine_columns()
-            self.set_status(f"Opened: {os.path.basename(file_path)}")          
+            self.set_status(f"Opened: {os.path.basename(file_path)}")
+            self._sv_update_combo()
+            self.log_usage(file_path)
+    
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open file: {e}")
             self.set_status("Error opening file")
-
-
+            
+    def _sync_globals_from_current_tab(self):
+        """
+        Update self.current_file and self.txt_sepa from the active tab's metadata.
+        Call this whenever the active tab changes.
+        """
+        meta = self.tab_meta.get(self.current_sheet_name)
+        if meta:
+            self.current_file = meta["file_path"]
+            self.txt_sepa     = meta["sep"] or ','
+        else:
+            self.current_file = None
+            self.txt_sepa     = ','
+        # Also update self.df
+        self.df = self.workbook_sheets.get(self.current_sheet_name, pd.DataFrame())
+        # print(f"_sync_globals_from_current_tab {self.current_sheet_name} {self.df}")
+        
     def save_file(self):
-        """Save file with Excel multi-sheet support."""
-        if self.current_file is None:
+        """
+        Save the currently active tab.
+        - Non-Excel tab  → saves just that file.
+        - Excel tab      → saves ALL tabs that belong to the same .xlsx file together.
+        """
+        meta = self.tab_meta.get(self.current_sheet_name)
+        if not meta or not meta.get("file_path"):
             self.save_file_as()
             return
-        
+    
         self.update_dataframe_from_sheet()
-        
+        file_path = meta["file_path"]
+    
         try:
-            if self.current_file.endswith(('.xlsx', '.xls')):
-                with pd.ExcelWriter(self.current_file, engine='openpyxl') as writer:
-                    for sheet_name, df in self.workbook_sheets.items():
-                        df_to_save = df.copy()
-                        df_to_save.replace(r'^\s*', '', regex=True, inplace=True)
-                        df_to_save.to_excel(writer, sheet_name=sheet_name, index=False)
+            if meta.get("is_excel"):
+                # Collect ALL tabs that share this exact excel file_path
+                excel_sheets = {
+                    sname: self.workbook_sheets[sname]
+                    for sname, m in self.tab_meta.items()
+                    if m.get("file_path") == file_path and sname in self.workbook_sheets
+                }
+                with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                    for tab_label, df in excel_sheets.items():
+                        # Strip the "filename » " prefix to get the real sheet name
+                        real_sheet = tab_label.split(" » ", 1)[-1] if " » " in tab_label else tab_label
+                        df_save = df.copy()
+                        df_save.replace(r'^\s*', '', regex=True, inplace=True)
+                        df_save.to_excel(writer, sheet_name=real_sheet, index=False)
+                # Mark all those tabs as clean
+                for sname, m in self.tab_meta.items():
+                    if m.get("file_path") == file_path:
+                        m["modified"] = False
             else:
                 df_to_save = self.df.copy()
-                # df_to_save.replace(r'^\s*', '', regex=True, inplace=True)
+                sep = meta.get("sep", ",")
                 df_to_save.replace(r'^\s*$', 'NaN', regex=True, inplace=True)
-                if self.txt_sepa == "#label":
-                    write_label_format(self.current_file, self.df, sep="::")
-                elif self.txt_sepa == r'\s+' or re.match(r'\s+', self.txt_sepa):
-                    df_to_save.to_string(buf=self.current_file, index=False, col_space=15, justify='left')
-                elif self.current_file.endswith(".tsv"):
-                    df_to_save.to_csv(self.current_file, sep="\t", index=False)
+                if sep == "#label":
+                    write_label_format(file_path, self.df, sep="::")
+                elif sep == r'\s+' or (sep and re.match(r'^\s+$', sep)):
+                    df_to_save.to_string(buf=file_path, index=False, col_space=15, justify='left')
+                elif file_path.endswith(".tsv"):
+                    df_to_save.to_csv(file_path, sep="\t", index=False)
                 else:
-                    self.df.to_csv(self.current_file, sep=self.txt_sepa, index=False, na_rep="")
-            
-            self.modified = False
+                    self.df.to_csv(file_path, sep=sep, index=False, na_rep="")
+                meta["modified"] = False
+    
+            # Recompute global modified
+            self.modified = any(m["modified"] for m in self.tab_meta.values())
             self.update_title()
-            self.set_status(f"Saved: {os.path.basename(self.current_file)}")
-            messagebox.showinfo("Saved", "File saved successfully!")
-            
+            self.set_status(f"Saved: {os.path.basename(file_path)}")
+            # messagebox.showinfo("Saved", "File saved successfully!")
+    
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save file: {e}")
+            messagebox.showerror("Error", f"Failed to save: {e}")
             self.set_status("Error saving file")
 
-
     def save_file_as(self):
-        """Save as with format selection."""
+        """Save current tab under a new filename."""
         file_path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
             filetypes=[
@@ -594,14 +779,23 @@ class TableEditor:
         )
         if not file_path:
             return
+        # Update this tab's metadata to the new path
+        if self.current_sheet_name in self.tab_meta:
+            self.tab_meta[self.current_sheet_name]["file_path"] = file_path
+            self.tab_meta[self.current_sheet_name]["is_excel"] = file_path.endswith(('.xlsx', '.xls'))
+            if not file_path.endswith(('.xlsx', '.xls')):
+                # Infer sep from extension
+                if file_path.endswith('.tsv'):
+                    self.tab_meta[self.current_sheet_name]["sep"] = "\t"
+                else:
+                    self.tab_meta[self.current_sheet_name]["sep"] = ","
         self.current_file = file_path
         self.save_file()
-
 
     def export_to_excel(self):
         """Export to Excel with formatting."""
         try:
-            import openpyxl
+            #import openpyxl
             from openpyxl.styles import Font, PatternFill, Alignment
         except ImportError:
             messagebox.showerror("Error", "openpyxl not installed. Using basic export.")
@@ -790,231 +984,173 @@ class TableEditor:
             messagebox.showerror("Error", f"Export failed: {e}")
             
     def open_file(self):
-        """Open file with multi-format support."""
-        if self.modified and not self.ask_save_changes("open a different file"):
-            return
-        
+        """
+        Open file dialog. If tabs already exist, ask:
+          - Add to session (append tabs)
+          - Replace session (clear and open fresh)
+        """
         file_path = filedialog.askopenfilename(
             filetypes=[
                 ("All Supported", "*.csv *.txt *.tsv *.xlsx *.xls"),
-                ("Excel files", "*.xlsx *.xls"),
-                ("CSV files", "*.csv"),
-                ("Text files", "*.txt *.tsv"),
-                ("All files", "*.*")
+                ("Excel files",   "*.xlsx *.xls"),
+                ("CSV/Text",      "*.csv *.txt *.tsv"),
+                ("All files",     "*.*"),
             ]
         )
         if not file_path:
             return
-        
-        self.load_file(file_path)
-        self.log_usage(file_path)
+    
+        has_existing = bool(self.tab_meta)   # any tabs already open?
+    
+        if has_existing:
+            choice = messagebox.askyesnocancel(
+                "Open File",
+                f"Add  '{os.path.basename(file_path)}'  to current session?\n\n"
+                "YES\t= Add as new tab(s)  ← keeps everything open\n"
+                "NO\t= Close all tabs and open fresh\n"
+                "CANCEL\t= Abort"
+            )
+            if choice is None:      # Cancel
+                return
+            if choice is False:     # No = replace session
+                if self.modified:
+                    if not self.ask_save_changes("close the current session"):
+                        return
+                self._close_all_tabs()
+    
+        self.load_file_guarded(file_path)
+        self._save_recent(file_path)
 
-
-    def new_file(self):
-        """Create new file."""
-        if self.modified and not self.ask_save_changes("create a new file"):
+    
+    def add_file(self):
+        """
+        Dedicated 'Add File' button/menu item.
+        Always appends — never asks, never clears.
+        Lets user choose separator before loading.
+        """
+        file_path = filedialog.askopenfilename(
+            title="Add File to Session",
+            filetypes=[
+                ("All Supported", "*.csv *.txt *.tsv *.xlsx *.xls"),
+                ("All files",     "*.*"),
+            ]
+        )
+        if not file_path:
             return
-        
+
+        # For non-Excel, let user confirm or override separator
+        if not file_path.endswith(('.xlsx', '.xls')):
+            # sep_choice = simpledialog.askstring(
+            #     "Separator",
+            #     f"Separator for  {os.path.basename(file_path)}\n"
+            #     "Leave blank = auto-detect\n"
+            #     "Options: ,   ;   \\t   |   \\s+   #label",
+            #     initialvalue=""
+            # )
+            force_sep = None
+            # if sep_choice and sep_choice.strip():
+            #     s = sep_choice.strip()
+            #     if s.lower() in ["\\t", "tab"]:
+            #         force_sep = "\t"
+            #     elif s.lower() in ["none", "auto", ""]:
+            #         force_sep = None
+            #     else:
+            #         force_sep = s
+            self.load_file_guarded(file_path, force_sep=force_sep)
+            self._save_recent(file_path)
+        else:
+            self.load_file_guarded(file_path)
+            self._save_recent(file_path)
+
+    def _close_all_tabs(self):
+        """Clear all tabs, data, and metadata. Used when replacing the session."""
         for tab_id in self.sheet_notebook.tabs():
             self.sheet_notebook.forget(tab_id)
         self.workbook_sheets.clear()
-        
-        self.df = pd.DataFrame(columns=["Column1", "Column2"])
-        sheet_widget = self._create_sheet_tab("Sheet1", self.df)
-        self._populate_sheet(sheet_widget, self.df)
-        
+        self.tab_meta.clear()
+        self.formula_cells.clear()
+        self.df = pd.DataFrame()
         self.current_file = None
+        self.current_sheet_name = None
+        self.txt_sepa = ','
         self.modified = False
         self.update_title()
+
+    def close_current_tab(self):
+        """Close the active tab, asking to save if dirty."""
+        self._clear_undo_for_tab(self.current_sheet_name)
+        if not self.current_sheet_name:
+            return
+    
+        meta = self.tab_meta.get(self.current_sheet_name, {})
+        if meta.get("modified"):
+            #fp = meta.get("file_path", "this tab")
+            result = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                f"'{self.current_sheet_name}' has unsaved changes.\n\nSave before closing?"
+            )
+            if result is None:    # Cancel
+                return
+            if result is True:    # Yes → save first
+                self.save_file()
+    
+        # Remove from all registries
+        name = self.current_sheet_name
+        current_tab = self.sheet_notebook.select()
+        self.sheet_notebook.forget(current_tab)
+        self.workbook_sheets.pop(name, None)
+        self.tab_meta.pop(name, None)
+        self.formula_cells.pop(name, None)
+    
+        self._sv_update_combo() 
+        # If no tabs left, create a blank one
+        if not self.sheet_notebook.tabs():
+            self.df = pd.DataFrame("",index=range(5), columns=["A", "B", "C", "D","E"])
+            widget = self._create_sheet_tab("Sheet1", self.df)
+            self._populate_sheet(widget, self.df)
+            self.current_file = None
+            self.txt_sepa = ','
+            self.modified = False
+            self.update_title()
+        else:
+            self._on_sheet_change()   # sync globals to newly active tab
+    
+        self.modified = any(m["modified"] for m in self.tab_meta.values())
+        self.update_title()
+        self.set_status(f"Closed tab: {name}")
+
+    def new_file(self):
+        """Create new empty file — replaces session after save prompt."""
+        if self.modified and not self.ask_save_changes("create a new file"):
+            return
+        self._close_all_tabs()
+        self.df = pd.DataFrame("",index=range(5), columns=["A", "B", "C", "D","E"])
+        sheet_widget = self._create_sheet_tab("Sheet1", self.df)
+        self._populate_sheet(sheet_widget, self.df)
         self.update_sheet_from_dataframe()
         self.update_dataframe_from_sheet()
         self.set_status("New file created")
 
+    def add_new_sheet(self, df = None, sheet_name = None):
+        """Create new empty file — replaces session after save prompt."""
+        # if self.modified and not self.ask_save_changes("create a new file"):
+        #     return
+        # self._close_all_tabs()
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame("",index=range(5), columns=["A", "B", "C", "D","E"])
+        if not sheet_name:
+            sheet_name = "Sheet1"
 
-    # Formula Methods
-    def _on_formula_enter(self, event=None):
-        """Handle formula entry from formula bar."""
-        sheet = self.get_current_sheet()
-        if not sheet:
-            return
+        sheet_widget = self._create_sheet_tab(sheet_name, df)
+        self._populate_sheet(sheet_widget, df)
+        self.sheet_notebook.select(len(self.sheet_notebook.tabs()) - 1)
+        # Update globals to reflect current tab
+        self._sync_globals_from_current_tab()
+        # print("tttttttttttttt")
+        # print(self.df)
+        self.set_status("New file created")
         
-        selected = sheet.get_currently_selected()
-        if not selected:
-            return
-        
-        row, col = selected[0], selected[1]
-        formula = self.formula_var.get()
-        
-        if formula.startswith('='):
-            if self.current_sheet_name not in self.formula_cells:
-                self.formula_cells[self.current_sheet_name] = {}
-            
-            cell_key = f"{row},{col}"
-            self.formula_cells[self.current_sheet_name][cell_key] = formula
-            
-            if self.auto_calc_var.get():
-                result = self.formula_engine.evaluate_formula(formula, row, col)
-                sheet.set_cell_data(row, col, str(result), redraw=True)
-                sheet.highlight_cells(row=row, column=col, bg="lightyellow", fg = "black")
-                self.set_status(f"Formula: {formula} = {result}")
-            else:
-                sheet.set_cell_data(row, col, formula, redraw=True)
-                sheet.highlight_cells(row=row, column=col, bg="lightblue", fg = "black")
-                self.set_status(f"Formula stored (not calculated). Click 'Calc' button.")
-        else:
-            sheet.set_cell_data(row, col, formula, redraw=True)
-            if self.current_sheet_name in self.formula_cells:
-                cell_key = f"{row},{col}"
-                self.formula_cells[self.current_sheet_name].pop(cell_key, None)
-                sheet.dehighlight_cells(row=row, column=col)
-        
-        self.mark_modified()
 
-
-    def _on_formula_focus_out(self, event=None):
-        """Handle when formula bar loses focus."""
-        sheet = self.get_current_sheet()
-        if not sheet:
-            return
-        
-        selected = sheet.get_currently_selected()
-        if not selected:
-            return
-        
-        row, col = selected[0], selected[1]
-        formula = self.formula_var.get()
-        
-        cell_key = f"{row},{col}"
-        sheet_formulas = self.formula_cells.get(self.current_sheet_name, {})
-        current_formula = sheet_formulas.get(cell_key, "")
-        current_value = sheet.get_cell_data(row, col)
-        
-        if formula != current_formula and formula != current_value:
-            self._on_formula_enter()
-
-
-    def calculate_current_cell(self):
-        """Calculate the currently selected cell (manual calc mode)."""
-        sheet = self.get_current_sheet()
-        if not sheet:
-            return
-        
-        selected = sheet.get_currently_selected()
-        if not selected:
-            messagebox.showinfo("Info", "Please select a cell first")
-            return
-        
-        row, col = selected[0], selected[1]
-        cell_key = f"{row},{col}"
-        sheet_formulas = self.formula_cells.get(self.current_sheet_name, {})
-        
-        if cell_key not in sheet_formulas:
-            messagebox.showinfo("Info", "Selected cell does not contain a formula")
-            return
-        
-        formula = sheet_formulas[cell_key]
-        result = self.formula_engine.evaluate_formula(formula, row, col)
-        sheet.set_cell_data(row, col, str(result), redraw=True)
-        sheet.highlight_cells(row=row, column=col, bg="lightyellow", fg = "black")
-        self.set_status(f"Calculated: {formula} = {result}")
-        self.mark_modified()
-
-
-    def on_cell_edit(self, event=None):
-        """Handle cell edit with formula evaluation."""
-        self.mark_modified()
-        sheet = self.get_current_sheet()
-        if not sheet:
-            return
-        
-        selected = sheet.get_currently_selected()
-        if not selected:
-            return
-        
-        row, col = selected[0], selected[1]
-        value = sheet.get_cell_data(row, col)
-        
-        if isinstance(value, str) and value.startswith('='):
-            if self.current_sheet_name not in self.formula_cells:
-                self.formula_cells[self.current_sheet_name] = {}
-            
-            cell_key = f"{row},{col}"
-            self.formula_cells[self.current_sheet_name][cell_key] = value
-            
-            if self.auto_calc_var.get():
-                result = self.formula_engine.evaluate_formula(value, row, col)
-                sheet.set_cell_data(row, col, str(result), redraw=True)
-                sheet.highlight_cells(row=row, column=col, bg="lightyellow", fg = "black")
-                self.set_status(f"Formula: {value} = {result}")
-            else:
-                sheet.highlight_cells(row=row, column=col, bg="lightblue", fg = "black")
-                self.set_status(f"Formula entered (not calculated). Use 'Calc' button.")
-        else:
-            if self.current_sheet_name in self.formula_cells:
-                cell_key = f"{row},{col}"
-                self.formula_cells[self.current_sheet_name].pop(cell_key, None)
-                sheet.dehighlight_cells(row=row, column=col)
-
-
-    def recalculate_all(self):
-        """Recalculate all formulas in current sheet."""
-        sheet = self.get_current_sheet()
-        if not sheet:
-            return
-        
-        count = 0
-        sheet_formulas = self.formula_cells.get(self.current_sheet_name, {})
-        
-        if not sheet_formulas:
-            messagebox.showinfo("Info", "No formulas found in current sheet")
-            return
-        
-        for cell_key, formula in sheet_formulas.items():
-            try:
-                r, c = map(int, cell_key.split(','))
-                result = self.formula_engine.evaluate_formula(formula, r, c)
-                sheet.set_cell_data(r, c, str(result), redraw=False)
-                sheet.highlight_cells(row=r, column=c, bg="lightyellow", fg = "black")
-                count += 1
-            except Exception as e:
-                print(f"Error recalculating {cell_key}: {e}")
-        
-        sheet.refresh()
-        self.set_status(f"Recalculated {count} formulas")
-        messagebox.showinfo("Recalculate All", f"Successfully recalculated {count} formulas!")
-
-
-    def insert_formula_template(self, template: str):
-        """Insert formula template."""
-        sheet = self.get_current_sheet()
-        if not sheet:
-            return
-        
-        selected = sheet.get_currently_selected()
-        if not selected:
-            messagebox.showinfo("Info", "Please select a cell first")
-            return
-        
-        row, col = selected[0], selected[1]
-        
-        if self.current_sheet_name not in self.formula_cells:
-            self.formula_cells[self.current_sheet_name] = {}
-        
-        cell_key = f"{row},{col}"
-        self.formula_cells[self.current_sheet_name][cell_key] = template
-        
-        if self.auto_calc_var.get():
-            result = self.formula_engine.evaluate_formula(template, row, col)
-            sheet.set_cell_data(row, col, str(result), redraw=True)
-            sheet.highlight_cells(row=row, column=col, bg="lightyellow", fg = "black")
-            self.set_status(f"Formula inserted: {template} = {result}")
-        else:
-            sheet.set_cell_data(row, col, template, redraw=True)
-            sheet.highlight_cells(row=row, column=col, bg="lightblue", fg = "black")
-            self.set_status(f"Formula inserted (not calculated): {template}")
-        
-        self.formula_var.set(template)
-        self.mark_modified()
 
     def update_selection_status(self, event=None):
         """Enhanced selection status with cell info."""
@@ -1189,7 +1325,7 @@ class TableEditor:
             col_index = sheet.get_currently_selected()[1] if sheet.get_currently_selected() else len(self.df.T)
             new_col = f"Column{len(self.df.columns) + 1}"
             # self.update_dataframe_from_sheet()
-            print('HereC1')
+            # print('HereC1')
         else:
             col_index = len(self.df.T)
             new_col = f"Column{len(self.df.columns) + 1}"
@@ -1210,11 +1346,11 @@ class TableEditor:
         sheet = self.get_current_sheet()
         if not sheet:
             return
-        print('Here')
+        # print('Here')
         if event:
             idx = sheet.get_currently_selected()[0] if sheet.get_currently_selected() else len(self.df)
             self.update_dataframe_from_sheet()
-            print('Here1')
+            # print('Here1')
         else:
             idx = len(self.df)
             # empty_row = pd.Series([""] * len(self.df.columns), index=self.df.columns)
@@ -1231,6 +1367,7 @@ class TableEditor:
         
     def clean_whitespace(self, event=None):
         """Insert column."""
+        self._push_undo()
         sheet = self.get_current_sheet()
         if not sheet:
             return
@@ -1248,12 +1385,13 @@ class TableEditor:
         self.update_sheet_from_dataframe()
         
         self.modified = True
-        self.update_title()
-        self.set_status(f"Extra space cleaned on columns (No Undo): {clean_col}")
+        self.mark_modified()
+        self.set_status(f"Extra space cleaned on columns: {clean_col}")
 
 
     def clean_nan(self, event=None):
         """Clean NaN/None values, prompting the user for the fill value."""
+        
         sheet = self.get_current_sheet()
         if not sheet:
             return
@@ -1282,6 +1420,7 @@ class TableEditor:
         fill_val = fill_value_input if fill_value_input != "" else " " 
 
         # 3. Apply the cleaning function
+        self._push_undo()
         self.df = fill_nulls(
             df = self.df, 
             columns = col_name, 
@@ -1292,7 +1431,7 @@ class TableEditor:
         self.update_sheet_from_dataframe()
         
         self.modified = True
-        self.update_title()
+        self.mark_modified()
         self.set_status(f"Cleaned NaN (No Undo): {clean_col} col with value '{fill_val}'")
 
     def change_separator(self):
@@ -1329,7 +1468,9 @@ class TableEditor:
             popup.destroy()
             
             if self.current_file:
-                self.load_file(self.current_file)
+                file_path = self.current_file
+                self.close_current_tab()
+                self.load_file(file_path = file_path, force_sep= sep_text)
             
             self.set_status(f"Separator: {repr(sep_text)}")
         
@@ -1518,3 +1659,154 @@ class TableEditor:
         text.config(state=tk.DISABLED)
         
         tb.Button(help_window, text="Close", command=help_window.destroy, bootstyle="secondary").pack(pady=10)
+        
+#------------------save recent
+    def _recent_path(self):
+        """Full path to the recent files JSON."""
+        # temp_path = Path(tempfile.gettempdir())
+        pathapp = self.get_appdata_path()
+        temp_file = os.path.join(pathapp, RECENT_FILE)
+        os.makedirs(pathapp, exist_ok=True)
+        return temp_file
+
+    def _load_recent(self):
+        """
+        Return list of recent file paths (strings).
+        Skips any path that no longer exists on disk.
+        Returns empty list if file missing or corrupt.
+        """
+        try:
+            with open(self._recent_path(), 'r', encoding='utf-8') as f:
+                paths = json.load(f)
+            # Filter out paths that have been deleted / moved
+            return [p for p in paths if os.path.exists(p)]
+        except Exception as e:
+            return []
+    
+    
+    def _save_recent(self, file_path):
+        """
+        Prepend file_path to the recent list and persist.
+        Keeps at most 10 entries. Deduplicates (path already
+        in the list is moved to top, not duplicated).
+        """
+        try:
+            paths = self._load_recent()
+            # Remove existing occurrence of this path if any
+            paths = [p for p in paths if p != file_path]
+            # Prepend the new entry
+            paths.insert(0, file_path)
+            # Trim to 10
+            paths = paths[:10]
+            print(self._recent_path())
+            with open(self._recent_path(), 'w', encoding='utf-8') as f:
+                json.dump(paths, f, indent=2)
+        except Exception:
+            print('recent file')
+            pass   # recent files are non-critical — never crash for this
+
+#------------------ col stat
+    def show_column_stats(self, col_name: str = None):
+        """
+        Show a popup with stats for the given column.
+        If col_name is None, detects from the current selection.
+        """
+        sheet = self.get_current_sheet()
+        if not sheet:
+            return
+    
+        # Auto-detect column from selection if not provided
+        if col_name is None:
+            selected = sheet.get_currently_selected()
+            if not selected:
+                messagebox.showinfo('Column Stats', 'Click a cell first.')
+                return
+            _, c = selected[0], selected[1]
+            headers = sheet.headers()
+            col_name = headers[c] if c < len(headers) else f'Col{c+1}'
+    
+        # Sync df from sheet before computing
+        self.update_dataframe_from_sheet()
+    
+        if col_name not in self.df.columns:
+            messagebox.showerror('Column Stats', f'Column "{col_name}" not found.')
+            return
+    
+        col = self.df[col_name]
+    
+        # ── Compute stats ─────────────────────────────────────────────────
+        total   = len(col)
+        # Treat empty string as null
+        nulls   = col.replace('', pd.NA).isna().sum()
+        filled  = total - nulls
+        unique  = col.nunique(dropna=True)
+    
+        # Numeric stats
+        nums = pd.to_numeric(col, errors='coerce').dropna()
+        is_numeric = len(nums) > 0
+    
+        # Top-5 most common values (for strings)
+        top5 = col[col != ''].value_counts().head(5)
+    
+        # ── Build popup ───────────────────────────────────────────────────
+        popup = tb.Toplevel(self.root)
+        popup.title(f'Column Stats — {col_name}')
+        popup.geometry('380x420')
+        popup.resizable(True, True)
+    
+        # Title bar inside popup
+        title_frame = tb.Frame(popup, bootstyle='primary')
+        title_frame.pack(fill='x')
+        tb.Label(
+            title_frame,
+            text=f'  {col_name}',
+            font=('Segoe UI', 11, 'bold'),
+            bootstyle='inverse-primary'
+        ).pack(side='left', pady=6)
+    
+        # Stats grid
+        frame = tb.Frame(popup)
+        frame.pack(fill='both', expand=True, padx=14, pady=10)
+    
+        def row_pair(label, value, r, highlight=False):
+            """Add a label-value pair in the grid."""
+            bg = '#EBF3FB' if highlight else None
+            lbl = tb.Label(frame, text=label, font=('Segoe UI', 9),
+                           foreground='#555555', width=16, anchor='w')
+            val = tb.Label(frame, text=str(value), font=('Segoe UI', 9, 'bold'),
+                           anchor='w')
+            lbl.grid(row=r, column=0, sticky='w', pady=2, padx=4)
+            val.grid(row=r, column=1, sticky='w', pady=2, padx=4)
+            if highlight:
+                lbl.configure(background=bg)
+                val.configure(background=bg)
+    
+        r = 0
+        row_pair('Total rows',   total,  r); r += 1
+        row_pair('Non-empty',    filled, r); r += 1
+        row_pair('Empty / null', nulls,  r, highlight=(nulls>0)); r += 1
+        row_pair('Unique values',unique, r); r += 1
+    
+        if is_numeric:
+            tb.Label(frame, text='── Numeric ──', font=('Segoe UI', 9),
+                     foreground='#888888').grid(
+                     row=r, column=0, columnspan=2, sticky='w', pady=(10,2), padx=4)
+            r += 1
+            row_pair('Min',   round(float(nums.min()), 6), r); r += 1
+            row_pair('Max',   round(float(nums.max()), 6), r); r += 1
+            row_pair('Mean',  round(float(nums.mean()), 6), r); r += 1
+            row_pair('Median',round(float(nums.median()), 6), r); r += 1
+            row_pair('Std dev',round(float(nums.std()), 6) if len(nums)>1 else 'n/a', r); r += 1
+    
+        # Top-5 most common
+        tb.Label(frame, text='── Top values ──', font=('Segoe UI', 9),
+                 foreground='#888888').grid(
+                 row=r, column=0, columnspan=2, sticky='w', pady=(10,2), padx=4)
+        r += 1
+        for val, cnt in top5.items():
+            display = str(val)[:28] + '...' if len(str(val)) > 28 else str(val)
+            row_pair(display, f'{cnt}×', r); r += 1
+    
+        tb.Button(popup, text='Close', command=popup.destroy,
+                  bootstyle='secondary').pack(pady=10)
+   
