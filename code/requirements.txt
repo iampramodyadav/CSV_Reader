@@ -3,3 +3,4 @@ ttkbootstrap
 tksheet
 pyvis
 openpyxl
+pyinstaller
